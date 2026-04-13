@@ -18,22 +18,50 @@ class FuzzySystemSolver:
 	Każdy rozmyty współczynnik parametryzowany jest zmienną RDM ∈ [0, 1]
 	na bazie horyzontalnych funkcji przynależności. Obwiednie (span)
 	wyznaczane są hybrydowo po wymiarach: dla `d` wybranych parametrów
-	stosowane jest RDM (wierzchołki), a dla pozostałych metoda Moore'a.
+	stosowane jest RDM (wierzchołki), a dla pozostałych metoda HMF.
 	"""
 
 	DEFAULT_VERTEX_BATCH_SIZE = 8192
 	MIN_VERTEX_BATCH_SIZE = 256
 	MAX_VERTEX_BATCH_SIZE = 16384
+	MAX_VERTEX_BATCH_SIZE_LARGE_L3 = 32768
+	LARGE_L3_THRESHOLD_BYTES = 96 * 1024 * 1024
 	DEFAULT_TARGET_BATCH_BYTES = 8 * 1024 * 1024
 	DEFAULT_FALLBACK_LEAF_SIZE = 1024
 	MIN_FALLBACK_LEAF_SIZE = 64
+	DEFAULT_AUTO_ALPHA_STEPS = 21
+	GAUSSIAN_AUTO_ALPHA_STEPS = 31
 
 	_cache_profile: dict[str, int] | None = None
 
-	def __init__(self, alpha_steps: int = 21, vertex_limit: int = 18) -> None:
-		self.alpha_steps = max(3, alpha_steps)
+	def __init__(self, vertex_limit: int = 18) -> None:
 		self.vertex_limit = max(0, int(vertex_limit))
 		self._cache_info = self._get_cache_profile()
+
+	def _auto_mu_levels(
+		self,
+		a_matrix: list[list[FuzzyNumber]],
+		b_vector: list[FuzzyNumber],
+	) -> np.ndarray:
+		"""Buduje automatyczne poziomy μ bez ręcznego parametru m.
+
+		Dla układów z gaussami używa nieco gęstszej siatki, aby stabilniej
+		odwzorować szerokie ogony nośnika przy małych wartościach μ.
+		"""
+		has_gaussian = any(cell.kind == "gaussian" for row in a_matrix for cell in row)
+		has_gaussian = has_gaussian or any(cell.kind == "gaussian" for cell in b_vector)
+
+		steps = self.GAUSSIAN_AUTO_ALPHA_STEPS if has_gaussian else self.DEFAULT_AUTO_ALPHA_STEPS
+		raw = np.linspace(0.0, 1.0, steps, dtype=float)
+		if has_gaussian:
+			# Delikatne zagęszczenie przy małych μ (szersze przekroje gaussowskie).
+			raw = raw * raw
+		levels = np.unique(np.clip(raw, 0.0, 1.0))
+		if levels[0] > 0.0:
+			levels = np.insert(levels, 0, 0.0)
+		if levels[-1] < 1.0:
+			levels = np.append(levels, 1.0)
+		return levels
 
 	@staticmethod
 	def _parse_cache_size_to_bytes(raw: str) -> int:
@@ -209,13 +237,15 @@ class FuzzySystemSolver:
 		return cls._cache_profile
 
 	def _vertex_batch_size(self, param_dim: int, n: int, num_vertices: int) -> int:
+		max_batch_size = self._max_vertex_batch_size()
+
 		override = os.getenv("FUZZY_SOLVER_BATCH_SIZE", "").strip()
 		if override:
 			try:
 				override_value = int(override)
 				clamped_override = max(
 					self.MIN_VERTEX_BATCH_SIZE,
-					min(self.MAX_VERTEX_BATCH_SIZE, override_value),
+					min(max_batch_size, override_value),
 				)
 				return min(num_vertices, clamped_override)
 			except ValueError:
@@ -229,8 +259,14 @@ class FuzzySystemSolver:
 		if estimated <= 0:
 			estimated = self.MIN_VERTEX_BATCH_SIZE
 
-		clamped = max(self.MIN_VERTEX_BATCH_SIZE, min(self.MAX_VERTEX_BATCH_SIZE, int(estimated)))
+		clamped = max(self.MIN_VERTEX_BATCH_SIZE, min(max_batch_size, int(estimated)))
 		return min(num_vertices, clamped)
+
+	def _max_vertex_batch_size(self) -> int:
+		l3_bytes = int(self._cache_info.get("l3_bytes", 0))
+		if l3_bytes >= self.LARGE_L3_THRESHOLD_BYTES:
+			return self.MAX_VERTEX_BATCH_SIZE_LARGE_L3
+		return self.MAX_VERTEX_BATCH_SIZE
 
 	def cache_profile(self) -> dict[str, int]:
 		"""Zwraca profil cache używany do auto-doboru batch size (L2/L3 + cel pamięciowy)."""
@@ -297,25 +333,10 @@ class FuzzySystemSolver:
 		batch_start: int,
 		batch_end: int,
 		cancel_check: Callable[[], bool] | None = None,
-	) -> tuple[np.ndarray, np.ndarray, bool, dict[str, int]]:
+	) -> tuple[np.ndarray, np.ndarray, bool]:
 		batch_count = batch_end - batch_start
 		x_lo = np.full(n, np.inf)
 		x_hi = np.full(n, -np.inf)
-		batch_stats: dict[str, int] = {
-			"batches_total": 1,
-			"batches_fallback": 0,
-			"vertices_total": int(batch_count),
-			"vertices_vectorized_solved": 0,
-			"vertices_scalar_solved": 0,
-			"vertices_lstsq_used": 0,
-			"vertices_det_zero": 0,
-			"vertices_rank_deficient": 0,
-			"vertices_nonfinite": 0,
-			"fallback_nodes": 0,
-			"split_nodes": 0,
-			"split_leaves": 0,
-			"split_depth_max": 0,
-		}
 
 		# Wektoryzowane generowanie bitów RDM redukuje narzut pętli interpretowanych.
 		if len(fuzzy_idx) <= 63:
@@ -340,94 +361,54 @@ class FuzzySystemSolver:
 		b_batch = vals_batch[:, n * n :]
 		leaf_size = self._fallback_leaf_size(batch_count)
 
-		def _new_recursive_stats() -> dict[str, int]:
-			return {
-				"vertices_vectorized_solved": 0,
-				"vertices_scalar_solved": 0,
-				"vertices_lstsq_used": 0,
-				"vertices_det_zero": 0,
-				"vertices_rank_deficient": 0,
-				"vertices_nonfinite": 0,
-				"fallback_nodes": 0,
-				"split_nodes": 0,
-				"split_leaves": 0,
-				"split_depth_max": 0,
-			}
-
-		def _merge_recursive(dst: dict[str, int], src: dict[str, int]) -> None:
-			for key in dst:
-				if key == "split_depth_max":
-					dst[key] = max(int(dst[key]), int(src.get(key, 0)))
-				else:
-					dst[key] += int(src.get(key, 0))
-
 		def _solve_recursive(
 			A_curr: np.ndarray,
 			b_curr: np.ndarray,
 			depth: int,
-		) -> tuple[np.ndarray, np.ndarray, bool, dict[str, int]]:
+		) -> tuple[np.ndarray, np.ndarray, bool]:
 			curr_count = int(A_curr.shape[0])
 			local_lo = np.full(n, np.inf)
 			local_hi = np.full(n, -np.inf)
-			stats = _new_recursive_stats()
-			stats["split_nodes"] = 1
-			stats["split_depth_max"] = depth
 
 			try:
 				x_batch_local = np.linalg.solve(
 					A_curr, b_curr[:, :, np.newaxis],
 				).squeeze(-1)
 				valid_local = np.all(np.isfinite(x_batch_local), axis=1)
-				stats["vertices_vectorized_solved"] = int(np.count_nonzero(valid_local))
-				stats["vertices_nonfinite"] += int(curr_count - stats["vertices_vectorized_solved"])
 				if np.any(valid_local):
 					xv = x_batch_local[valid_local]
 					local_lo = np.minimum(local_lo, np.min(xv, axis=0))
 					local_hi = np.maximum(local_hi, np.max(xv, axis=0))
 				has_local = not np.any(np.isinf(local_lo))
-				return local_lo, local_hi, has_local, stats
+				return local_lo, local_hi, has_local
 			except np.linalg.LinAlgError:
-				stats["fallback_nodes"] = 1
+				pass
 
 			if curr_count <= leaf_size:
-				stats["split_leaves"] = 1
 				for v in range(curr_count):
 					if (v & 0xFF) == 0:
 						self._check_cancel(cancel_check)
 					try:
 						x = np.linalg.solve(A_curr[v], b_curr[v])
 					except np.linalg.LinAlgError:
-						det_sign, _det_log_abs = np.linalg.slogdet(A_curr[v])
-						if det_sign == 0.0:
-							stats["vertices_det_zero"] += 1
 						x, residuals, rank, _ = np.linalg.lstsq(A_curr[v], b_curr[v], rcond=None)
-						stats["vertices_lstsq_used"] += 1
 						if rank < n:
-							stats["vertices_rank_deficient"] += 1
-							stats["vertices_nonfinite"] += 1
 							continue
 						if residuals.size and not np.all(np.isfinite(residuals)):
-							stats["vertices_nonfinite"] += 1
 							continue
 					if np.all(np.isfinite(x)):
-						stats["vertices_scalar_solved"] += 1
 						local_lo = np.minimum(local_lo, x)
 						local_hi = np.maximum(local_hi, x)
-					else:
-						stats["vertices_nonfinite"] += 1
 				has_local = not np.any(np.isinf(local_lo))
-				return local_lo, local_hi, has_local, stats
+				return local_lo, local_hi, has_local
 
 			mid = curr_count // 2
 			if mid <= 0 or mid >= curr_count:
-				stats["split_leaves"] = 1
 				has_local = False
-				return local_lo, local_hi, has_local, stats
+				return local_lo, local_hi, has_local
 
-			left_lo, left_hi, left_has, left_stats = _solve_recursive(A_curr[:mid], b_curr[:mid], depth + 1)
-			right_lo, right_hi, right_has, right_stats = _solve_recursive(A_curr[mid:], b_curr[mid:], depth + 1)
-			_merge_recursive(stats, left_stats)
-			_merge_recursive(stats, right_stats)
+			left_lo, left_hi, left_has = _solve_recursive(A_curr[:mid], b_curr[:mid], depth + 1)
+			right_lo, right_hi, right_has = _solve_recursive(A_curr[mid:], b_curr[mid:], depth + 1)
 
 			if left_has:
 				local_lo = np.minimum(local_lo, left_lo)
@@ -437,17 +418,13 @@ class FuzzySystemSolver:
 				local_hi = np.maximum(local_hi, right_hi)
 
 			has_local = not np.any(np.isinf(local_lo))
-			return local_lo, local_hi, has_local, stats
+			return local_lo, local_hi, has_local
 
 		try:
 			x_batch = np.linalg.solve(
 				A_batch, b_batch[:, :, np.newaxis],
 			).squeeze(-1)
-			batch_stats["split_nodes"] = 1
-			batch_stats["split_depth_max"] = 0
 			valid = np.all(np.isfinite(x_batch), axis=1)
-			batch_stats["vertices_vectorized_solved"] = int(np.count_nonzero(valid))
-			batch_stats["vertices_nonfinite"] += int(batch_count - batch_stats["vertices_vectorized_solved"])
 			if np.any(valid):
 				xv = x_batch[valid]
 				x_lo = np.minimum(x_lo, np.min(xv, axis=0))
@@ -455,16 +432,10 @@ class FuzzySystemSolver:
 		except np.linalg.LinAlgError:
 			# W przypadku osobliwości dzielimy batch i schodzimy rekurencyjnie
 			# tylko do problematycznych fragmentów.
-			batch_stats["batches_fallback"] = 1
-			x_lo, x_hi, _has_result_recursive, recursive_stats = _solve_recursive(A_batch, b_batch, 0)
-			for key in recursive_stats:
-				if key == "split_depth_max":
-					batch_stats[key] = max(int(batch_stats.get(key, 0)), int(recursive_stats[key]))
-				else:
-					batch_stats[key] = int(batch_stats.get(key, 0)) + int(recursive_stats[key])
+			x_lo, x_hi, _has_result_recursive = _solve_recursive(A_batch, b_batch, 0)
 
 		has_result = not np.any(np.isinf(x_lo))
-		return x_lo, x_hi, has_result, batch_stats
+		return x_lo, x_hi, has_result
 
 	@staticmethod
 	def _parametrize_rdm(
@@ -512,7 +483,7 @@ class FuzzySystemSolver:
 		n: int,
 		progress_tick: Callable[[int], None] | None = None,
 		cancel_check: Callable[[], bool] | None = None,
-	) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+	) -> tuple[np.ndarray, np.ndarray]:
 		"""Dokładne obwiednie – pełne wyliczenie wierzchołków {0,1}^d."""
 		self._check_cancel(cancel_check)
 		d_fuzzy = len(fuzzy_idx)
@@ -526,21 +497,7 @@ class FuzzySystemSolver:
 				raise ValueError("Układ osobliwy") from exc
 			if progress_tick is not None:
 				progress_tick(1)
-			return x.copy(), x.copy(), {
-				"batches_total": 1,
-				"batches_fallback": 0,
-				"vertices_total": 1,
-				"vertices_vectorized_solved": 1,
-				"vertices_scalar_solved": 0,
-				"vertices_lstsq_used": 0,
-				"vertices_det_zero": 0,
-				"vertices_rank_deficient": 0,
-				"vertices_nonfinite": 0,
-				"fallback_nodes": 0,
-				"split_nodes": 1,
-				"split_leaves": 1,
-				"split_depth_max": 0,
-			}
+			return x.copy(), x.copy()
 
 		x_lo = np.full(n, np.inf)
 		x_hi = np.full(n, -np.inf)
@@ -552,37 +509,13 @@ class FuzzySystemSolver:
 			batch_end = min(batch_start + batch_size, num_vertices)
 			batch_ranges.append((batch_start, batch_end))
 
-		total_stats: dict[str, int] = {
-			"batches_total": 0,
-			"batches_fallback": 0,
-			"vertices_total": 0,
-			"vertices_vectorized_solved": 0,
-			"vertices_scalar_solved": 0,
-			"vertices_lstsq_used": 0,
-			"vertices_det_zero": 0,
-			"vertices_rank_deficient": 0,
-			"vertices_nonfinite": 0,
-			"fallback_nodes": 0,
-			"split_nodes": 0,
-			"split_leaves": 0,
-			"split_depth_max": 0,
-		}
-
-		def _merge_stats(partial: dict[str, int]) -> None:
-			for key in total_stats:
-				if key == "split_depth_max":
-					total_stats[key] = max(int(total_stats[key]), int(partial.get(key, 0)))
-				else:
-					total_stats[key] += int(partial.get(key, 0))
-
 		workers = self._vertex_parallel_workers(num_batches=len(batch_ranges))
 		if workers <= 1:
 			for batch_start, batch_end in batch_ranges:
 				self._check_cancel(cancel_check)
-				batch_lo, batch_hi, has_result, batch_stats = self._solve_vertex_batch(
+				batch_lo, batch_hi, has_result = self._solve_vertex_batch(
 					lo, widths, fuzzy_idx, n, batch_start, batch_end, cancel_check,
 				)
-				_merge_stats(batch_stats)
 				if has_result:
 					x_lo = np.minimum(x_lo, batch_lo)
 					x_hi = np.maximum(x_hi, batch_hi)
@@ -609,8 +542,7 @@ class FuzzySystemSolver:
 					self._check_cancel(cancel_check)
 					done, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
 					for future in done:
-						batch_lo, batch_hi, has_result, batch_stats = future.result()
-						_merge_stats(batch_stats)
+						batch_lo, batch_hi, has_result = future.result()
 						if has_result:
 							x_lo = np.minimum(x_lo, batch_lo)
 							x_hi = np.maximum(x_hi, batch_hi)
@@ -627,7 +559,7 @@ class FuzzySystemSolver:
 
 		if np.any(np.isinf(x_lo)):
 			raise ValueError("Układ osobliwy")
-		return x_lo, x_hi, total_stats
+		return x_lo, x_hi
 
 	@staticmethod
 	def _mul_interval(a_l: float, a_u: float, b_l: float, b_u: float) -> tuple[float, float]:
@@ -652,34 +584,7 @@ class FuzzySystemSolver:
 		r_u = max(r1, r2)
 		return FuzzySystemSolver._mul_interval(n_l, n_u, r_l, r_u)
 
-	def _moore_solve(
-		self,
-		lo: np.ndarray,
-		widths: np.ndarray,
-		fuzzy_idx: np.ndarray,
-		n: int,
-		progress_tick: Callable[[int], None] | None = None,
-		cancel_check: Callable[[], bool] | None = None,
-	) -> tuple[np.ndarray, np.ndarray]:
-		"""Wyznacza obwiednie rozwiązania metodą przedziałową Moore'a."""
-		self._check_cancel(cancel_check)
-		d_fuzzy = len(fuzzy_idx)
-		if d_fuzzy == 0:
-			rdm = np.zeros_like(lo)
-			A, b_vec = self._build_system(lo, widths, rdm, n)
-			try:
-				x = np.linalg.solve(A, b_vec)
-			except np.linalg.LinAlgError as exc:
-				raise ValueError("Układ osobliwy") from exc
-			if progress_tick is not None:
-				progress_tick(1)
-			return x.copy(), x.copy()
-
-		vals_l = lo.copy()
-		vals_u = lo + widths
-		return self._moore_solve_from_bounds(vals_l, vals_u, n, progress_tick, cancel_check)
-
-	def _moore_solve_from_bounds(
+	def _hmf_solve_from_bounds(
 		self,
 		vals_l: np.ndarray,
 		vals_u: np.ndarray,
@@ -687,20 +592,7 @@ class FuzzySystemSolver:
 		progress_tick: Callable[[int], None] | None = None,
 		cancel_check: Callable[[], bool] | None = None,
 	) -> tuple[np.ndarray, np.ndarray]:
-		"""Wyznacza obwiednie rozwiązania metodą iteracyjną Moore'a dla gotowych granic wektora parametrów.
-
-		Stosuje rozkład C = inv(A_mid) i iteracyjne zawężanie przedziałów przez arytmetykę
-		przedziałową do osiągnięcia zbieżności lub wyczerpania limitu iteracji (max_iter = 120).
-
-		Args:
-			vals_l: Dolne granice spłaszczonego wektora [a_11, …, a_nn, b_1, …, b_n].
-			vals_u: Górne granice o tym samym układzie co vals_l.
-			n: Rozmiar układu równań (n×n).
-			progress_tick: Opcjonalny callback wywoływany po zakończeniu obliczeń.
-
-		Returns:
-			Krotka (x_lower, x_upper) – wektory dolnych i górnych granic rozwiązania.
-		"""
+		"""Szybka obwiednia HMF: przybliżenie środkiem + krótka relaksacja przedziałowa."""
 		A_l = vals_l[: n * n].reshape(n, n)
 		A_u = vals_u[: n * n].reshape(n, n)
 		b_l = vals_l[n * n :]
@@ -709,75 +601,40 @@ class FuzzySystemSolver:
 		A_mid = 0.5 * (A_l + A_u)
 		b_mid = 0.5 * (b_l + b_u)
 		try:
-			C = np.linalg.inv(A_mid)
+			x_mid = np.linalg.solve(A_mid, b_mid)
 		except np.linalg.LinAlgError:
-			C = np.linalg.pinv(A_mid)
-
-		Ap_l = np.zeros((n, n), dtype=float)
-		Ap_u = np.zeros((n, n), dtype=float)
-		bp_l = np.zeros(n, dtype=float)
-		bp_u = np.zeros(n, dtype=float)
-
-		for i in range(n):
-			self._check_cancel(cancel_check)
-			for j in range(n):
-				s_l = 0.0
-				s_u = 0.0
-				for k in range(n):
-					c = C[i, k]
-					if c >= 0.0:
-						t_l, t_u = c * A_l[k, j], c * A_u[k, j]
-					else:
-						t_l, t_u = c * A_u[k, j], c * A_l[k, j]
-					s_l += t_l
-					s_u += t_u
-				Ap_l[i, j] = s_l
-				Ap_u[i, j] = s_u
-
-		for i in range(n):
-			self._check_cancel(cancel_check)
-			s_l = 0.0
-			s_u = 0.0
-			for k in range(n):
-				c = C[i, k]
-				if c >= 0.0:
-					t_l, t_u = c * b_l[k], c * b_u[k]
-				else:
-					t_l, t_u = c * b_u[k], c * b_l[k]
-				s_l += t_l
-				s_u += t_u
-			bp_l[i] = s_l
-			bp_u[i] = s_u
+			x_mid, _residuals, rank, _ = np.linalg.lstsq(A_mid, b_mid, rcond=None)
+			if int(rank) < int(n):
+				raise ValueError("Układ osobliwy")
 
 		try:
-			x0 = np.linalg.solve(A_mid, b_mid)
-			base_span = max(1.0, 0.5 * float(np.max(np.abs(x0))))
+			inv_mid = np.linalg.inv(A_mid)
 		except np.linalg.LinAlgError:
-			x0 = np.zeros(n, dtype=float)
-			base_span = 5.0
+			inv_mid = np.linalg.pinv(A_mid)
 
-		x_l = x0 - base_span
-		x_u = x0 + base_span
+		A_rad = 0.5 * np.abs(A_u - A_l)
+		b_rad = 0.5 * np.abs(b_u - b_l)
+		radius = np.abs(inv_mid) @ (A_rad @ np.abs(x_mid) + b_rad)
+		x_l = x_mid - radius
+		x_u = x_mid + radius
 
-		max_iter = 120
-		for _ in range(max_iter):
+		# Dwie szybkie iteracje relaksacji znacząco zwężają przedziały przy małym koszcie.
+		for _ in range(2):
 			self._check_cancel(cancel_check)
 			changed = False
 			for i in range(n):
-				self._check_cancel(cancel_check)
 				s_l = 0.0
 				s_u = 0.0
 				for j in range(n):
 					if j == i:
 						continue
-					t_l, t_u = self._mul_interval(Ap_l[i, j], Ap_u[i, j], x_l[j], x_u[j])
+					t_l, t_u = self._mul_interval(A_l[i, j], A_u[i, j], x_l[j], x_u[j])
 					s_l += t_l
 					s_u += t_u
 
-				n_l = bp_l[i] - s_u
-				n_u = bp_u[i] - s_l
-				c_l, c_u = self._div_interval(n_l, n_u, Ap_l[i, i], Ap_u[i, i])
-
+				n_l = b_l[i] - s_u
+				n_u = b_u[i] - s_l
+				c_l, c_u = self._div_interval(n_l, n_u, A_l[i, i], A_u[i, i])
 				if np.isfinite(c_l) and np.isfinite(c_u):
 					new_l = max(x_l[i], c_l)
 					new_u = min(x_u[i], c_u)
@@ -785,7 +642,6 @@ class FuzzySystemSolver:
 						if abs(new_l - x_l[i]) > 1e-12 or abs(new_u - x_u[i]) > 1e-12:
 							changed = True
 						x_l[i], x_u[i] = new_l, new_u
-
 			if not changed:
 				break
 
@@ -808,7 +664,7 @@ class FuzzySystemSolver:
 		progress_tick: Callable[[int], None] | None = None,
 		cancel_check: Callable[[], bool] | None = None,
 	) -> tuple[np.ndarray, np.ndarray, int]:
-		"""Hybryda wymiarowa: RDM dla d_limit zmiennych, Moore dla pozostałych."""
+		"""Hybryda wymiarowa: RDM dla d_limit zmiennych, HMF dla pozostałych."""
 		self._check_cancel(cancel_check)
 		d_fuzzy = len(fuzzy_idx)
 		if d_fuzzy == 0:
@@ -824,7 +680,9 @@ class FuzzySystemSolver:
 
 		sampled_dims = min(max(0, int(d_limit)), d_fuzzy)
 		if sampled_dims == 0:
-			xl, xu = self._moore_solve(lo, widths, fuzzy_idx, n, progress_tick, cancel_check)
+			vals_l = lo.copy()
+			vals_u = lo + widths
+			xl, xu = self._hmf_solve_from_bounds(vals_l, vals_u, n, progress_tick, cancel_check)
 			return xl, xu, 0
 
 		order = np.argsort(np.abs(widths[fuzzy_idx]))[::-1]
@@ -851,7 +709,7 @@ class FuzzySystemSolver:
 			vals_u[selected_idx] = selected_vals
 
 			try:
-				xl_v, xu_v = self._moore_solve_from_bounds(vals_l, vals_u, n, None, cancel_check)
+				xl_v, xu_v = self._hmf_solve_from_bounds(vals_l, vals_u, n, None, cancel_check)
 				if np.all(np.isfinite(xl_v)) and np.all(np.isfinite(xu_v)):
 					x_lo = np.minimum(x_lo, xl_v)
 					x_hi = np.maximum(x_hi, xu_v)
@@ -883,23 +741,16 @@ class FuzzySystemSolver:
 		"""
 		n = len(a_matrix)
 		self._check_cancel(cancel_check)
-		mu_levels = np.linspace(0.0, 1.0, self.alpha_steps)
-		x_lower = np.zeros((self.alpha_steps, n), dtype=float)
-		x_upper = np.zeros((self.alpha_steps, n), dtype=float)
-		d_fuzzy_levels = np.zeros(self.alpha_steps, dtype=int)
-		method_flags = np.zeros(self.alpha_steps, dtype=np.int8)
-		sampled_vertices_levels = np.zeros(self.alpha_steps, dtype=int)
-		sampled_dims_levels = np.zeros(self.alpha_steps, dtype=int)
-		vertex_batch_levels = np.zeros(self.alpha_steps, dtype=int)
-		vertex_batch_total_levels = np.zeros(self.alpha_steps, dtype=int)
-		vertex_batch_fallback_levels = np.zeros(self.alpha_steps, dtype=int)
-		vertex_det_zero_levels = np.zeros(self.alpha_steps, dtype=int)
-		vertex_lstsq_levels = np.zeros(self.alpha_steps, dtype=int)
-		vertex_split_nodes_levels = np.zeros(self.alpha_steps, dtype=int)
-		vertex_split_leaves_levels = np.zeros(self.alpha_steps, dtype=int)
-		vertex_split_depth_levels = np.zeros(self.alpha_steps, dtype=int)
+		mu_levels = self._auto_mu_levels(a_matrix, b_vector)
+		level_count = len(mu_levels)
+		x_lower = np.zeros((level_count, n), dtype=float)
+		x_upper = np.zeros((level_count, n), dtype=float)
+		d_fuzzy_levels = np.zeros(level_count, dtype=int)
+		method_flags = np.zeros(level_count, dtype=np.int8)
+		sampled_vertices_levels = np.zeros(level_count, dtype=int)
+		sampled_dims_levels = np.zeros(level_count, dtype=int)
 		vertex_levels = 0
-		moore_levels = 0
+		hmf_levels = 0
 		hybrid_levels = 0
 
 		level_data: list[tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int]] = []
@@ -909,7 +760,7 @@ class FuzzySystemSolver:
 			d_fuzzy = len(fuzzy_idx)
 			batch_size = self._vertex_batch_size(param_dim=len(lo), n=n, num_vertices=max(1, (1 << d_fuzzy) if d_fuzzy > 0 else 1))
 			if d_limit == 0:
-				mode_flag = 1  # pełny Moore
+				mode_flag = 1  # pełny HMF
 				units = 1
 				effective_dims = 0
 			elif d_limit >= d_fuzzy:
@@ -923,7 +774,6 @@ class FuzzySystemSolver:
 				units = num_vertices
 				effective_dims = d_limit
 			level_data.append((lo, widths, fuzzy_idx, mode_flag, units, effective_dims))
-			vertex_batch_levels[len(level_data) - 1] = batch_size
 
 		total_units = 0
 		for _lo, _w, _fuzzy_idx, _mode_flag, units, _effective_dims in level_data:
@@ -959,21 +809,16 @@ class FuzzySystemSolver:
 			d_fuzzy_levels[mu_idx] = d_fuzzy
 
 			if mode_flag == 0:
-				xl, xu, vertex_stats = self._vertex_solve(lo, widths, fuzzy_idx, n, progress_tick, cancel_check)
-				vertex_batch_total_levels[mu_idx] = int(vertex_stats.get("batches_total", 0))
-				vertex_batch_fallback_levels[mu_idx] = int(vertex_stats.get("batches_fallback", 0))
-				vertex_det_zero_levels[mu_idx] = int(vertex_stats.get("vertices_det_zero", 0))
-				vertex_lstsq_levels[mu_idx] = int(vertex_stats.get("vertices_lstsq_used", 0))
-				vertex_split_nodes_levels[mu_idx] = int(vertex_stats.get("split_nodes", 0))
-				vertex_split_leaves_levels[mu_idx] = int(vertex_stats.get("split_leaves", 0))
-				vertex_split_depth_levels[mu_idx] = int(vertex_stats.get("split_depth_max", 0))
+				xl, xu = self._vertex_solve(lo, widths, fuzzy_idx, n, progress_tick, cancel_check)
 				vertex_levels += 1
 			elif mode_flag == 1:
-				xl, xu = self._moore_solve(lo, widths, fuzzy_idx, n, progress_tick, cancel_check)
+				vals_l = lo.copy()
+				vals_u = lo + widths
+				xl, xu = self._hmf_solve_from_bounds(vals_l, vals_u, n, progress_tick, cancel_check)
 				method_flags[mu_idx] = 1
 				sampled_vertices_levels[mu_idx] = 0
 				sampled_dims_levels[mu_idx] = 0
-				moore_levels += 1
+				hmf_levels += 1
 			else:
 				xl, xu, sampled_dims = self._hybrid_param_solve(
 					lo, widths, fuzzy_idx, n, effective_dims, progress_tick, cancel_check,
@@ -987,7 +832,7 @@ class FuzzySystemSolver:
 			x_upper[mu_idx, :] = xu
 
 		# Zapewnienie monotoniczności obwiedni względem poziomu μ.
-		for mu_idx in range(1, self.alpha_steps):
+		for mu_idx in range(1, level_count):
 			x_lower[mu_idx, :] = np.maximum(
 				x_lower[mu_idx, :], x_lower[mu_idx - 1, :]
 			)
@@ -996,7 +841,7 @@ class FuzzySystemSolver:
 			)
 
 		# Zapewnienie relacji porządkowej lower <= upper.
-		for mu_idx in range(self.alpha_steps):
+		for mu_idx in range(level_count):
 			mid = (x_lower[mu_idx, :] + x_upper[mu_idx, :]) / 2.0
 			x_lower[mu_idx, :] = np.minimum(x_lower[mu_idx, :], mid)
 			x_upper[mu_idx, :] = np.maximum(x_upper[mu_idx, :], mid)
@@ -1009,35 +854,18 @@ class FuzzySystemSolver:
 			"x_lower": x_lower,
 			"x_upper": x_upper,
 			"meta": {
+				"alpha_mode": "auto-horizontal",
+				"alpha_levels_count": level_count,
 				"d_fuzzy_levels": d_fuzzy_levels,
 				"method_flags": method_flags,
 				"sampled_vertices_levels": sampled_vertices_levels,
 				"sampled_dims_levels": sampled_dims_levels,
 				"vertex_levels": vertex_levels,
-				"moore_levels": moore_levels,
+				"hmf_levels": hmf_levels,
 				"hybrid_levels": hybrid_levels,
-				"monotonicity_levels": moore_levels,
+				"monotonicity_levels": hmf_levels,
 				"sampled_vertices_total": int(np.sum(sampled_vertices_levels)),
 				"sampled_dims_max": int(np.max(sampled_dims_levels)),
-				"vertex_batch_levels": vertex_batch_levels,
-				"vertex_batch_total_levels": vertex_batch_total_levels,
-				"vertex_batch_fallback_levels": vertex_batch_fallback_levels,
-				"vertex_det_zero_levels": vertex_det_zero_levels,
-				"vertex_lstsq_levels": vertex_lstsq_levels,
-				"vertex_split_nodes_levels": vertex_split_nodes_levels,
-				"vertex_split_leaves_levels": vertex_split_leaves_levels,
-				"vertex_split_depth_levels": vertex_split_depth_levels,
-				"vertex_batch_total": int(np.sum(vertex_batch_total_levels)),
-				"vertex_batch_fallback_total": int(np.sum(vertex_batch_fallback_levels)),
-				"vertex_batch_fallback_rate": float(
-					float(np.sum(vertex_batch_fallback_levels)) / max(1.0, float(np.sum(vertex_batch_total_levels)))
-				),
-				"vertex_det_zero_total": int(np.sum(vertex_det_zero_levels)),
-				"vertex_lstsq_total": int(np.sum(vertex_lstsq_levels)),
-				"vertex_split_nodes_total": int(np.sum(vertex_split_nodes_levels)),
-				"vertex_split_leaves_total": int(np.sum(vertex_split_leaves_levels)),
-				"vertex_split_depth_max": int(np.max(vertex_split_depth_levels)),
-				"vertex_batch_size_max": int(np.max(vertex_batch_levels)),
 				"vertex_limit": self.vertex_limit,
 				"rdm_dims_requested": d_limit,
 				"cache_l2_bytes": int(self._cache_info.get("l2_bytes", 0)),

@@ -42,7 +42,6 @@ class SolveWorker(QObject):
 		self,
 		a_matrix: list[list[FuzzyNumber]],
 		b_vector: list[FuzzyNumber],
-		alpha_steps: int,
 		vertex_limit: int,
 		request_id: int,
 		size_n: int,
@@ -51,14 +50,13 @@ class SolveWorker(QObject):
 		super().__init__()
 		self.a_matrix = [row[:] for row in a_matrix]
 		self.b_vector = b_vector[:]
-		self.alpha_steps = int(alpha_steps)
 		self.vertex_limit = int(vertex_limit)
 		self.request_id = int(request_id)
 		self.size_n = int(size_n)
 		self.cancel_event = cancel_event
 
 	def run(self) -> None:
-		solver = FuzzySystemSolver(alpha_steps=self.alpha_steps, vertex_limit=self.vertex_limit)
+		solver = FuzzySystemSolver(vertex_limit=self.vertex_limit)
 
 		def on_progress(done_units: int, total_units: int) -> None:
 			total = max(1, int(total_units))
@@ -1779,7 +1777,7 @@ class MainWindow(QMainWindow):
 		self.setWindowTitle("Rozwiązywanie Układów Równań Rozmytych")
 		self.setMinimumSize(1420, 820)
 
-		self.solver = FuzzySystemSolver(alpha_steps=21, vertex_limit=18)
+		self.solver = FuzzySystemSolver(vertex_limit=18)
 		self.current_size = 2
 		self.a_values: list[list[FuzzyNumber]] = []
 		self.b_values: list[FuzzyNumber] = []
@@ -1812,7 +1810,6 @@ class MainWindow(QMainWindow):
 		self._progress_percent = 0.0
 		self._solve_cancel_event: threading.Event | None = None
 		self._pending_vertex_limit: int | None = None
-		self._pending_alpha_steps: int | None = None
 		self._vertex_limit_apply_timer = QTimer(self)
 		self._vertex_limit_apply_timer.setSingleShot(True)
 		self._vertex_limit_apply_timer.setInterval(120)
@@ -1874,13 +1871,6 @@ class MainWindow(QMainWindow):
 		self.vertex_limit_spin.setKeyboardTracking(False)
 		self.vertex_limit_spin.valueChanged.connect(self.on_vertex_limit_changed)
 		d_row.addWidget(self.vertex_limit_spin)
-		d_row.addWidget(QLabel("m:"))
-		self.alpha_steps_spin = QSpinBox()
-		self.alpha_steps_spin.setRange(3, 301)
-		self.alpha_steps_spin.setValue(21)
-		self.alpha_steps_spin.setKeyboardTracking(False)
-		self.alpha_steps_spin.valueChanged.connect(self.on_alpha_steps_changed)
-		d_row.addWidget(self.alpha_steps_spin)
 		d_row.addStretch(1)
 		size_layout.addLayout(d_row)
 		panel_layout.addWidget(size_group)
@@ -2237,7 +2227,7 @@ class MainWindow(QMainWindow):
 		for i in range(size):
 			label = QLabel(f"x{i + 1}: --")
 			self.results_layout.addWidget(label)
-		self.dimension_usage_label = QLabel("d: RDM -- | Moore --")
+		self.dimension_usage_label = QLabel("d: RDM -- | HMF --")
 		self.dimension_usage_label.setStyleSheet("QLabel { color: #444444; }")
 		self.results_layout.addWidget(self.dimension_usage_label)
 		self.limit_usage_label = None
@@ -2687,19 +2677,18 @@ class MainWindow(QMainWindow):
 		if self.dimension_usage_label is not None:
 			self.dimension_usage_label.setText(text)
 
-	def _format_dimension_usage_text(self, rdm_value: int, moore_value: int) -> str:
+	def _format_dimension_usage_text(self, rdm_value: int, hmf_value: int) -> str:
 		rdm = max(0, int(rdm_value))
-		moore = max(0, int(moore_value))
+		hmf = max(0, int(hmf_value))
 
-		return f"d: RDM {rdm} | Moore {moore}"
+		return f"d: RDM {rdm} | HMF {hmf}"
 
 	def _dimension_usage_text_from_input(self) -> str:
-		alpha_steps = max(3, int(self.solver.alpha_steps))
-		mu_levels = np.linspace(0.0, 1.0, alpha_steps)
+		mu_levels = self.solver._auto_mu_levels(self.a_values, self.b_values)
 		d_limit = max(0, int(self.solver.vertex_limit))
 
 		rdm_dims_levels: list[int] = []
-		moore_dims_levels: list[int] = []
+		hmf_dims_levels: list[int] = []
 		for mu in mu_levels:
 			d_fuzzy = 0
 			for i in range(self.current_size):
@@ -2714,11 +2703,11 @@ class MainWindow(QMainWindow):
 
 			rdm_dims = min(d_limit, d_fuzzy)
 			rdm_dims_levels.append(int(rdm_dims))
-			moore_dims_levels.append(int(d_fuzzy - rdm_dims))
+			hmf_dims_levels.append(int(d_fuzzy - rdm_dims))
 
 		rdm_max = max(rdm_dims_levels)
-		moore_max = max(moore_dims_levels)
-		return self._format_dimension_usage_text(rdm_max, moore_max)
+		hmf_max = max(hmf_dims_levels)
+		return self._format_dimension_usage_text(rdm_max, hmf_max)
 
 	def _update_dimension_usage_label(self) -> None:
 		if self.current_solution is None:
@@ -2753,7 +2742,7 @@ class MainWindow(QMainWindow):
 			return
 
 		rdm_dims_levels = np.zeros_like(d_fuzzy_levels)
-		moore_dims_levels = np.zeros_like(d_fuzzy_levels)
+		hmf_dims_levels = np.zeros_like(d_fuzzy_levels)
 
 		for idx in range(len(d_fuzzy_levels)):
 			d_fuzzy = int(d_fuzzy_levels[idx])
@@ -2767,11 +2756,11 @@ class MainWindow(QMainWindow):
 
 			rdm_dims = max(0, min(rdm_dims, d_fuzzy))
 			rdm_dims_levels[idx] = rdm_dims
-			moore_dims_levels[idx] = d_fuzzy - rdm_dims
+			hmf_dims_levels[idx] = d_fuzzy - rdm_dims
 
 		rdm_max = int(np.max(rdm_dims_levels))
-		moore_max = int(np.max(moore_dims_levels))
-		self._set_dimension_usage_text(self._format_dimension_usage_text(rdm_max, moore_max))
+		hmf_max = int(np.max(hmf_dims_levels))
+		self._set_dimension_usage_text(self._format_dimension_usage_text(rdm_max, hmf_max))
 
 	def _solution_center_vector(self) -> np.ndarray | None:
 		if self.current_solution is None:
@@ -2812,13 +2801,38 @@ class MainWindow(QMainWindow):
 		if not getattr(self.eq_canvas, "trend_point_exists", False):
 			self.trend_point_label.setText("")
 			return
-		x_vec = getattr(self.eq_canvas, "trend_point_vector", None)
-		if not isinstance(x_vec, np.ndarray) or x_vec.ndim != 1 or x_vec.size == 0:
+		proj_vec = getattr(self.eq_canvas, "trend_point_vector", None)
+		if not isinstance(proj_vec, np.ndarray) or proj_vec.ndim != 1 or proj_vec.size == 0:
 			self.trend_point_label.setText("")
 			return
+
+		n = max(0, int(self.current_size))
+		if n <= 0:
+			self.trend_point_label.setText("")
+			return
+
+		full_values: list[float | None] = [None] * n
+		fixed_values = self.selected_slice_values()
+		for idx, val in fixed_values.items():
+			if 0 <= idx < n:
+				full_values[idx] = float(val)
+
+		selected = self.selected_projection_indices()
+		for local_idx, var_idx in enumerate(selected):
+			if local_idx >= proj_vec.size:
+				break
+			if 0 <= var_idx < n:
+				full_values[var_idx] = float(proj_vec[local_idx])
+
+		if any(v is None for v in full_values):
+			d = self.decimals.value()
+			vals = ", ".join(f"{float(v):.{d}f}" for v in proj_vec)
+			self.trend_point_label.setText(f"[{vals}]")
+			return
+
 		d = self.decimals.value()
-		vals = ", ".join(f"{float(v):.{d}f}" for v in x_vec)
-		self.trend_point_label.setText(f"[{vals}]")
+		parts = [f"x{idx + 1}={float(full_values[idx]):.{d}f}" for idx in range(n)]
+		self.trend_point_label.setText(f"[{', '.join(parts)}]")
 
 	def _set_interaction_enabled(self, enabled: bool) -> None:
 		# UI pozostaje interaktywny podczas solve; worker pracuje na snapshotach.
@@ -2984,7 +2998,6 @@ class MainWindow(QMainWindow):
 		worker = SolveWorker(
 			a_snapshot,
 			b_snapshot,
-			alpha_steps=int(self.solver.alpha_steps),
 			vertex_limit=int(self.solver.vertex_limit),
 			request_id=request_id,
 			size_n=size_snapshot,
@@ -3176,21 +3189,6 @@ class MainWindow(QMainWindow):
 			return
 		self.solver.vertex_limit = new_limit
 		self._pending_vertex_limit = None
-		self.solve_system()
-
-	def on_alpha_steps_changed(self, value: int) -> None:
-		new_steps = max(3, int(value))
-		old_steps = max(3, int(self.solver.alpha_steps))
-		self._pending_alpha_steps = new_steps
-		if new_steps == old_steps:
-			self._pending_alpha_steps = None
-			return
-		self.solver.alpha_steps = new_steps
-		if self._solve_in_progress:
-			self._cancel_active_solve()
-			self._solve_pending = True
-			return
-		self._pending_alpha_steps = None
 		self.solve_system()
 
 	def _on_eq_canvas_limits_changed(
@@ -3426,7 +3424,6 @@ class MainWindow(QMainWindow):
 
 	def refresh_ui(self) -> None:
 		step = 10 ** (-self.decimals.value())
-		self.solver.alpha_steps = max(3, int(self.alpha_steps_spin.value()))
 		self.plot_canvas.set_decimals(self.decimals.value())
 		self.eq_canvas.decimals = self.decimals.value()
 		for value_input in self.slice_inputs:

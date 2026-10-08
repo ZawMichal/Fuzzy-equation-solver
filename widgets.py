@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 	QProgressBar,
 	QScrollArea,
 	QSlider,
+	QSplitter,
 	QSpinBox,
 	QStackedWidget,
 	QVBoxLayout,
@@ -76,7 +77,7 @@ class SolveWorker(QObject):
 			self.finished.emit(self.request_id, None, "__cancelled__", self.size_n)
 		except ValueError as exc:
 			self.finished.emit(self.request_id, None, str(exc), self.size_n)
-		except Exception as exc:  # noqa: BLE001 – celowe: wszystkie wyjątki tłumaczone na komunikaty UI
+		except Exception as exc:  # noqa: BLE001 - wszystkie wyjątki są mapowane na komunikaty interfejsu.
 			err = str(exc).lower()
 			if isinstance(exc, np.linalg.LinAlgError) or "singular" in err or "osobliw" in err:
 				self.finished.emit(self.request_id, None, "Układ osobliwy", self.size_n)
@@ -738,8 +739,8 @@ class LinearEquationCanvas(FigureCanvasQTAgg):
 			return None
 		res = B - A @ x
 		scale = max(1.0, float(np.max(np.abs(B))))
-		# Kryterium istnienia punktu jest zgodne z aktualną dokładnością prezentacji.
-		# Przy d miejscach po przecinku dopuszczamy błąd rzędu 0.5 * 10^{-d} skali równania.
+		# Kryterium uznania punktu za należący do przekroju jest zgodne z bieżącą dokładnością prezentacji.
+		# Dla d miejsc po przecinku dopuszczamy błąd rzędu 0.5 * 10^{-d} skali równania.
 		prec = max(0, int(self.decimals))
 		tol = (0.5 * (10.0 ** (-prec)) * scale) + 1e-12
 		if float(np.max(np.abs(res))) > tol:
@@ -934,31 +935,8 @@ class LinearEquationCanvas(FigureCanvasQTAgg):
 		if len(solution_eq_indices) < 2:
 			return []
 
-		halfplanes_solution: list[tuple[float, float, float]] = []
-		if solution is not None:
-			x_lower = solution.get("x_lower")
-			x_upper = solution.get("x_upper")
-			if isinstance(x_lower, np.ndarray) and isinstance(x_upper, np.ndarray) and x_lower.ndim == 2 and x_upper.ndim == 2:
-				if x_lower.shape[0] > 0 and x_upper.shape[0] > 0 and var_x < x_lower.shape[1] and var_y < x_lower.shape[1]:
-					x_l0 = float(x_lower[0, var_x])
-					x_h0 = float(x_upper[0, var_x])
-					y_l0 = float(x_lower[0, var_y])
-					y_h0 = float(x_upper[0, var_y])
-					halfplanes_solution.extend(
-						[
-							(1.0, 0.0, x_h0),
-							(-1.0, 0.0, -x_l0),
-							(0.0, 1.0, y_h0),
-							(0.0, -1.0, -y_l0),
-						]
-					)
-					for var_idx, fixed_val in fixed_values.items():
-						if var_idx in (var_x, var_y) or var_idx >= x_lower.shape[1]:
-							continue
-						left = float(x_lower[0, var_idx])
-						right = float(x_upper[0, var_idx])
-						if fixed_val < left - 1e-9 or fixed_val > right + 1e-9:
-							return []
+		# Nie przycinamy już po x_lower/x_upper z solwera: przy HMF/hybrydzie
+		# są to często zbyt ciasne przybliżenia i mogą odcinać poprawne punkty.
 
 		quadrants = [
 			(True, True),
@@ -982,7 +960,6 @@ class LinearEquationCanvas(FigureCanvasQTAgg):
 			]
 			all_planes: list[tuple[float, float, float]] = []
 			all_planes.extend(quadrant_planes)
-			all_planes.extend(halfplanes_solution)
 
 			for eq_idx in solution_eq_indices:
 				a1_fuzzy = a_matrix[eq_idx][var_x]
@@ -1449,9 +1426,9 @@ class LinearEquationCanvas(FigureCanvasQTAgg):
 							if var_idx < len(a_matrix[eq_idx]):
 								b_rep -= a_matrix[eq_idx][var_idx].representative() * fixed_val
 						x_vert = b_rep / a1_rep
-						self.ax.axvline(x_vert, color=color, linewidth=2.0, linestyle="--", zorder=5)
 						yv = np.linspace(self.y_min, self.y_max, 80)
 						xv = np.full_like(yv, x_vert)
+						self.ax.plot(xv, yv, color=color, linewidth=2.0, linestyle="--", zorder=5)
 						self._add_snap_points(xv, yv, stride=3)
 				else:
 					for var_idx, fixed_val in fixed_values.items():
@@ -1472,6 +1449,28 @@ class LinearEquationCanvas(FigureCanvasQTAgg):
 			solution_color = "#333333"
 			drew_solution_bounds = False
 			if show_solution_bounds:
+				support_rect: tuple[float, float, float, float] | None = None
+				if isinstance(solution, dict):
+					x_lower = solution.get("x_lower")
+					x_upper = solution.get("x_upper")
+					if (
+						isinstance(x_lower, np.ndarray)
+						and isinstance(x_upper, np.ndarray)
+						and x_lower.ndim == 2
+						and x_upper.ndim == 2
+						and x_lower.shape == x_upper.shape
+						and x_lower.shape[0] > 0
+						and x_lower.shape[1] > max(var_x, var_y)
+					):
+						x_lo = float(x_lower[0, var_x])
+						x_hi = float(x_upper[0, var_x])
+						y_lo = float(x_lower[0, var_y])
+						y_hi = float(x_upper[0, var_y])
+						if np.isfinite(x_lo) and np.isfinite(x_hi) and np.isfinite(y_lo) and np.isfinite(y_hi):
+							x_lo, x_hi = min(x_lo, x_hi), max(x_lo, x_hi)
+							y_lo, y_hi = min(y_lo, y_hi), max(y_lo, y_hi)
+							support_rect = (x_lo, x_hi, y_lo, y_hi)
+
 				analytic_failed = False
 				analytic_polygons: list[np.ndarray] = []
 				try:
@@ -1486,6 +1485,19 @@ class LinearEquationCanvas(FigureCanvasQTAgg):
 					)
 				except Exception:
 					analytic_failed = True
+
+				if support_rect is not None and analytic_polygons:
+					x_lo, x_hi, y_lo, y_hi = support_rect
+					clipped_polygons: list[np.ndarray] = []
+					for poly in analytic_polygons:
+						polygon_pts = [(float(p[0]), float(p[1])) for p in poly]
+						polygon_pts = self._clip_polygon_halfplane(polygon_pts, 1.0, 0.0, x_hi)
+						polygon_pts = self._clip_polygon_halfplane(polygon_pts, -1.0, 0.0, -x_lo)
+						polygon_pts = self._clip_polygon_halfplane(polygon_pts, 0.0, 1.0, y_hi)
+						polygon_pts = self._clip_polygon_halfplane(polygon_pts, 0.0, -1.0, -y_lo)
+						if len(polygon_pts) >= 2:
+							clipped_polygons.append(np.array(polygon_pts, dtype=float))
+					analytic_polygons = clipped_polygons
 
 				if analytic_polygons:
 					axis_eps = 1e-9 * max(1.0, abs(self.x_max - self.x_min), abs(self.y_max - self.y_min))
@@ -1515,8 +1527,21 @@ class LinearEquationCanvas(FigureCanvasQTAgg):
 							drew_solution_bounds = True
 							self._add_snap_points(x_seg, y_seg, stride=1)
 				elif analytic_failed:
-					x_grid = np.linspace(self.x_min, self.x_max, 240)
-					y_grid = np.linspace(self.y_min, self.y_max, 240)
+					if support_rect is not None:
+						x_lo, x_hi, y_lo, y_hi = support_rect
+						x_min = max(self.x_min, x_lo)
+						x_max = min(self.x_max, x_hi)
+						y_min = max(self.y_min, y_lo)
+						y_max = min(self.y_max, y_hi)
+						if x_max <= x_min or y_max <= y_min:
+							x_grid = np.linspace(self.x_min, self.x_max, 240)
+							y_grid = np.linspace(self.y_min, self.y_max, 240)
+						else:
+							x_grid = np.linspace(x_min, x_max, 240)
+							y_grid = np.linspace(y_min, y_max, 240)
+					else:
+						x_grid = np.linspace(self.x_min, self.x_max, 240)
+						y_grid = np.linspace(self.y_min, self.y_max, 240)
 					X, Y = np.meshgrid(x_grid, y_grid)
 					alpha_min = np.ones_like(X)
 
@@ -1836,7 +1861,7 @@ class MainWindow(QMainWindow):
 		main_layout.setSpacing(8)
 
 		self.input_panel = QWidget()
-		self.input_panel.setFixedWidth(240)
+		self.input_panel.setMinimumWidth(240)
 		panel_layout = QVBoxLayout(self.input_panel)
 		panel_layout.setContentsMargins(8, 8, 8, 8)
 		panel_layout.setSpacing(6)
@@ -2047,9 +2072,17 @@ class MainWindow(QMainWindow):
 		self.eq_canvas.z_max = self.eq_y_max_spin.value()
 		far_right_layout.addWidget(self.eq_canvas, stretch=1)
 
-		main_layout.addWidget(self.input_panel)
-		main_layout.addWidget(center_right, stretch=1)
-		main_layout.addWidget(far_right, stretch=1)
+		self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+		self.main_splitter.setChildrenCollapsible(False)
+		self.main_splitter.setHandleWidth(9)
+		self.main_splitter.addWidget(self.input_panel)
+		self.main_splitter.addWidget(center_right)
+		self.main_splitter.addWidget(far_right)
+		self.main_splitter.setStretchFactor(0, 0)
+		self.main_splitter.setStretchFactor(1, 1)
+		self.main_splitter.setStretchFactor(2, 1)
+		self.main_splitter.setSizes([300, 640, 480])
+		main_layout.addWidget(self.main_splitter, stretch=1)
 
 		self.current_size = 2
 		self.rebuild_system(self.current_size)
@@ -2663,7 +2696,6 @@ class MainWindow(QMainWindow):
 		return d_fuzzy
 
 	def update_limit_usage_label(self) -> None:
-		# Celowo puste – wyświetlanie limitu d zastąpione paskiem postępu.
 		return
 
 	def _set_solution_text(self, texts: list[str]) -> None:
@@ -2835,11 +2867,9 @@ class MainWindow(QMainWindow):
 		self.trend_point_label.setText(f"[{', '.join(parts)}]")
 
 	def _set_interaction_enabled(self, enabled: bool) -> None:
-		# UI pozostaje interaktywny podczas solve; worker pracuje na snapshotach.
 		return
 
 	def _set_progress_label(self) -> None:
-		# Celowo puste – etykieta zastąpiona przez solve_progress_bar.
 		return
 
 	def _format_elapsed(self, total_seconds: int) -> str:
@@ -2856,7 +2886,7 @@ class MainWindow(QMainWindow):
 		elapsed = max(0.0, now - self._solve_started_at)
 		percent = max(0.0, min(100.0, float(self._solve_last_progress_percent)))
 
-		# Okno próbek czasowych ogranicza wpływ chwilowych fluktuacji tempa.
+		# Okno próbek czasowych stabilizuje estymację tempa i ogranicza wpływ chwilowych fluktuacji.
 		while self._progress_samples and (now - self._progress_samples[0][0]) > 45.0:
 			self._progress_samples.popleft()
 

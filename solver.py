@@ -99,7 +99,7 @@ class FuzzySystemSolver:
 		l2_values_kb: list[int] = []
 		l3_values_kb: list[int] = []
 
-		# Prefer WMIC when present (fast and simple), fallback to PowerShell CIM.
+		# Preferujemy WMIC, a w razie jego braku przechodzimy do zapytania przez PowerShell CIM.
 		try:
 			proc = subprocess.run(
 				["wmic", "cpu", "get", "L2CacheSize,L3CacheSize", "/value"],
@@ -553,8 +553,7 @@ class FuzzySystemSolver:
 					future.cancel()
 				raise
 			finally:
-				# Czekamy na zakończenie uruchomionych zadań, aby nie zostawiać
-				# aktywnych wątków po wyjściu z solve (stabilność UI/aplikacji).
+				# Oczekujemy na zakończenie uruchomionych zadań, aby nie pozostawiać aktywnych wątków po zakończeniu obliczeń.
 				pool.shutdown(wait=True, cancel_futures=True)
 
 		if np.any(np.isinf(x_lo)):
@@ -591,7 +590,8 @@ class FuzzySystemSolver:
 		n: int,
 		progress_tick: Callable[[int], None] | None = None,
 		cancel_check: Callable[[], bool] | None = None,
-	) -> tuple[np.ndarray, np.ndarray]:
+		return_iterations: bool = False,
+	) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, int]:
 		"""Szybka obwiednia HMF: przybliżenie środkiem + krótka relaksacja przedziałowa."""
 		A_l = vals_l[: n * n].reshape(n, n)
 		A_u = vals_u[: n * n].reshape(n, n)
@@ -617,9 +617,11 @@ class FuzzySystemSolver:
 		radius = np.abs(inv_mid) @ (A_rad @ np.abs(x_mid) + b_rad)
 		x_l = x_mid - radius
 		x_u = x_mid + radius
+		iterations = 0
 
 		# Dwie szybkie iteracje relaksacji znacząco zwężają przedziały przy małym koszcie.
 		for _ in range(2):
+			iterations += 1
 			self._check_cancel(cancel_check)
 			changed = False
 			for i in range(n):
@@ -652,6 +654,8 @@ class FuzzySystemSolver:
 			raise ValueError("Układ osobliwy")
 		if np.any(x_l > x_u):
 			raise ValueError("Układ osobliwy")
+		if return_iterations:
+			return x_l, x_u, iterations
 		return x_l, x_u
 
 	def _hybrid_param_solve(
